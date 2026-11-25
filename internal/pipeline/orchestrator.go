@@ -546,30 +546,48 @@ func (o *Orchestrator) processRepo(
 	overflowCh := make(chan github.OverflowTask, 256)
 	var apiProducersWG sync.WaitGroup
 
-	// Stream A: GraphQL Issues (+ embedded comments & timeline)
+	// Stream A: Parallel State-Partitioned GraphQL Issues (OPEN & CLOSED concurrently!)
 	if o.opts.Selection.Issues {
-		apiProducersWG.Add(1)
-		subWG.Add(1)
-		go func() {
-			defer subWG.Done()
-			defer apiProducersWG.Done()
-			if err := o.runIssuesStream(ctx, idx, targetStore, repoID, owner, name, apiSem, overflowCh); err != nil {
-				errCh <- fmt.Errorf("%s issues: %w", fullName, err)
-			}
-		}()
+		for _, part := range []struct {
+			stream string
+			states []string
+		}{
+			{"gql_issues_open", []string{"OPEN"}},
+			{"gql_issues_closed", []string{"CLOSED"}},
+		} {
+			part := part
+			apiProducersWG.Add(1)
+			subWG.Add(1)
+			go func() {
+				defer subWG.Done()
+				defer apiProducersWG.Done()
+				if err := o.runIssuesStream(ctx, idx, targetStore, repoID, owner, name, part.stream, part.states, apiSem, overflowCh); err != nil {
+					errCh <- fmt.Errorf("%s issues (%s): %w", fullName, part.stream, err)
+				}
+			}()
+		}
 	}
 
-	// Stream B: GraphQL Pull Requests (+ embedded comments, reviews & timeline)
+	// Stream B: Parallel State-Partitioned GraphQL Pull Requests (MERGED vs OPEN+CLOSED concurrently!)
 	if o.opts.Selection.PRs || o.opts.Selection.Reviews {
-		apiProducersWG.Add(1)
-		subWG.Add(1)
-		go func() {
-			defer subWG.Done()
-			defer apiProducersWG.Done()
-			if err := o.runPRsStream(ctx, idx, targetStore, repoID, owner, name, apiSem, overflowCh); err != nil {
-				errCh <- fmt.Errorf("%s prs: %w", fullName, err)
-			}
-		}()
+		for _, part := range []struct {
+			stream string
+			states []string
+		}{
+			{"gql_prs_merged", []string{"MERGED"}},
+			{"gql_prs_other", []string{"OPEN", "CLOSED"}},
+		} {
+			part := part
+			apiProducersWG.Add(1)
+			subWG.Add(1)
+			go func() {
+				defer subWG.Done()
+				defer apiProducersWG.Done()
+				if err := o.runPRsStream(ctx, idx, targetStore, repoID, owner, name, part.stream, part.states, apiSem, overflowCh); err != nil {
+					errCh <- fmt.Errorf("%s prs (%s): %w", fullName, part.stream, err)
+				}
+			}()
+		}
 	}
 
 	// Stream C: REST Repo-Wide Inline PR Review Comments Sweep (runs on independent REST quota!)
@@ -674,11 +692,11 @@ func (o *Orchestrator) runIssuesStream(
 	idx int,
 	st *store.Store,
 	repoID int64,
-	owner, name string,
+	owner, name, stream string,
+	states []string,
 	apiSem chan struct{},
 	overflowCh chan<- github.OverflowTask,
 ) error {
-	const stream = "gql_issues"
 	cp, err := st.GetCheckpoint(ctx, repoID, stream)
 	if err != nil {
 		return err
@@ -717,7 +735,7 @@ func (o *Orchestrator) runIssuesStream(
 		})
 
 		page, perr := o.gh.FetchIssuesPage(
-			ctx, repoID, owner, name, cursor, sinceISO,
+			ctx, repoID, owner, name, cursor, sinceISO, states,
 			o.opts.Selection.Comments, o.opts.Selection.Timeline,
 		)
 		o.apiBusy.Add(-1)
@@ -783,11 +801,11 @@ func (o *Orchestrator) runPRsStream(
 	idx int,
 	st *store.Store,
 	repoID int64,
-	owner, name string,
+	owner, name, stream string,
+	states []string,
 	apiSem chan struct{},
 	overflowCh chan<- github.OverflowTask,
 ) error {
-	const stream = "gql_prs"
 	cp, err := st.GetCheckpoint(ctx, repoID, stream)
 	if err != nil {
 		return err
@@ -826,7 +844,7 @@ func (o *Orchestrator) runPRsStream(
 		})
 
 		page, perr := o.gh.FetchPRsPage(
-			ctx, repoID, owner, name, cursor, descending, cutoff,
+			ctx, repoID, owner, name, cursor, states, descending, cutoff,
 			o.opts.Selection.Comments, o.opts.Selection.Reviews, o.opts.Selection.Timeline,
 		)
 		o.apiBusy.Add(-1)
@@ -909,7 +927,9 @@ func (o *Orchestrator) failRepo(idx int, err error) {
 
 func (o *Orchestrator) recomputeRepoPctLocked(r *RepoProgress) {
 	var done, total float64
-	if o.opts.Selection.Commits {
+	// Only count commits in progress once commit parsing has started (or in commits-only mode),
+	// so the initial git clone download doesn't drag down API progress and inflate ETA.
+	if o.opts.Selection.Commits && (!o.opts.Selection.AnyAPI() || r.CommitsDone > 0) {
 		done += float64(r.CommitsDone)
 		if r.CommitsTotal > 0 {
 			total += float64(r.CommitsTotal)
@@ -918,7 +938,7 @@ func (o *Orchestrator) recomputeRepoPctLocked(r *RepoProgress) {
 		}
 	}
 	if o.opts.Selection.Issues {
-		done += float64(r.IssuesDone) * 4 // Weight API items higher than local git commits
+		done += float64(r.IssuesDone) * 4
 		total += float64(maxInt(r.IssuesTotal, r.IssuesDone)) * 4
 	}
 	if o.opts.Selection.PRs || o.opts.Selection.Reviews {
@@ -946,7 +966,7 @@ func (o *Orchestrator) recomputeRepoPctLocked(r *RepoProgress) {
 		if elapsed > 0.5 {
 			r.ItemsPerSec = float64(items) / elapsed
 		}
-		if r.ProgressPct > 2.0 && elapsed > 1.0 {
+		if r.ProgressPct > 1.5 && elapsed > 3.0 {
 			remSec := elapsed * ((100.0 - r.ProgressPct) / r.ProgressPct)
 			r.ETASeconds = int64(math.Ceil(remSec))
 		}
@@ -979,7 +999,7 @@ func (o *Orchestrator) Snapshot() TelemetrySnapshot {
 
 	repoCopies := make([]RepoProgress, len(o.repos))
 	var remGQLPages int
-	var maxGitETASec int64
+	var maxRepoETASec int64
 	for i, rp := range o.repos {
 		repoCopies[i] = *rp
 		if rp.State == "done" || rp.State == "error" {
@@ -988,9 +1008,9 @@ func (o *Orchestrator) Snapshot() TelemetrySnapshot {
 		remIssues := maxInt(0, rp.IssuesTotal-rp.IssuesDone)
 		remPRs := maxInt(0, rp.PRsTotal-rp.PRsDone)
 		remOverflow := maxInt(0, rp.OverflowQueued-rp.OverflowDone)
-		remGQLPages += (remIssues+29)/30 + (remPRs+24)/25 + remOverflow
-		if rp.ETASeconds > maxGitETASec {
-			maxGitETASec = rp.ETASeconds
+		remGQLPages += (remIssues+44)/45 + (remPRs+34)/35 + remOverflow
+		if rp.ETASeconds > maxRepoETASec {
+			maxRepoETASec = rp.ETASeconds
 		}
 	}
 
@@ -999,14 +1019,24 @@ func (o *Orchestrator) Snapshot() TelemetrySnapshot {
 	finished := o.finished
 	o.mu.Unlock()
 
-	// Rate-Limit-Aware ETA calculation
+	// Rate-Limit-Aware ETA calculation using true measured cumulative/EWMA GQL throughput
 	var totalETASec int64
 	var cooldownNote string
 	if !finished {
 		usableGQL, hourlyCapGQL, earliestReset := o.pool.PooledAvailable(tokenpool.BucketGraphQL)
+		elapsedSec := time.Since(o.startedAt).Seconds()
 		reqRate := o.ewmaGQLPerSec
-		if reqRate < 1.5 {
-			reqRate = 3.0 // Conservative baseline 3 pages/sec
+		if elapsedSec > 10 && metrics.GQLPoints > 5 {
+			// Blend cumulative average with EWMA for rock-steady ETA without jitter
+			cumRate := float64(metrics.GQLPoints) / elapsedSec
+			if reqRate > 0 {
+				reqRate = 0.6*cumRate + 0.4*reqRate
+			} else {
+				reqRate = cumRate
+			}
+		}
+		if reqRate < 0.15 {
+			reqRate = 1.0 // Initial warm-up baseline before enough pages complete
 		}
 		execSec := float64(remGQLPages) / reqRate
 		var cooldownSec float64
@@ -1030,8 +1060,8 @@ func (o *Orchestrator) Snapshot() TelemetrySnapshot {
 
 		apiETA := int64(math.Ceil(execSec + cooldownSec))
 		totalETASec = apiETA
-		if maxGitETASec > totalETASec && cooldownSec == 0 {
-			totalETASec = maxGitETASec
+		if !o.opts.Selection.AnyAPI() && maxRepoETASec > totalETASec {
+			totalETASec = maxRepoETASec
 		}
 	}
 

@@ -206,10 +206,10 @@ type gqlActor struct {
 }
 
 const issuesPageQuery = `
-query($owner: String!, $name: String!, $cursor: String, $since: DateTime, $includeComments: Boolean!, $includeTimeline: Boolean!) {
+query($owner: String!, $name: String!, $cursor: String, $since: DateTime, $states: [IssueState!], $includeComments: Boolean!, $includeTimeline: Boolean!) {
   rateLimit { limit remaining cost resetAt }
   repository(owner: $owner, name: $name) {
-    issues(first: 30, after: $cursor, filterBy: {since: $since}, orderBy: {field: UPDATED_AT, direction: ASC}) {
+    issues(first: 45, after: $cursor, states: $states, filterBy: {since: $since}, orderBy: {field: UPDATED_AT, direction: ASC}) {
       pageInfo { hasNextPage endCursor }
       nodes {
         number
@@ -288,6 +288,7 @@ func (c *Client) FetchIssuesPage(
 	ctx context.Context,
 	repoID int64,
 	owner, name, cursor, sinceISO string,
+	states []string,
 	includeComments, includeTimeline bool,
 ) (*IssuesPageResult, error) {
 	vars := map[string]any{
@@ -301,6 +302,9 @@ func (c *Client) FetchIssuesPage(
 	}
 	if sinceISO != "" {
 		vars["since"] = sinceISO
+	}
+	if len(states) > 0 {
+		vars["states"] = states
 	}
 
 	var resp struct {
@@ -470,10 +474,10 @@ func (c *Client) FetchIssuesPage(
 }
 
 const prsPageQueryTemplate = `
-query($owner: String!, $name: String!, $cursor: String, $includeComments: Boolean!, $includeReviews: Boolean!, $includeTimeline: Boolean!) {
+query($owner: String!, $name: String!, $cursor: String, $states: [PullRequestState!], $includeComments: Boolean!, $includeReviews: Boolean!, $includeTimeline: Boolean!) {
   rateLimit { limit remaining cost resetAt }
   repository(owner: $owner, name: $name) {
-    pullRequests(first: 25, after: $cursor, orderBy: {field: UPDATED_AT, direction: %s}) {
+    pullRequests(first: 35, after: $cursor, states: $states, orderBy: {field: UPDATED_AT, direction: %s}) {
       pageInfo { hasNextPage endCursor }
       nodes {
         number
@@ -577,6 +581,7 @@ func (c *Client) FetchPRsPage(
 	ctx context.Context,
 	repoID int64,
 	owner, name, cursor string,
+	states []string,
 	descending bool,
 	cutoff time.Time,
 	includeComments, includeReviews, includeTimeline bool,
@@ -595,6 +600,9 @@ func (c *Client) FetchPRsPage(
 	}
 	if cursor != "" {
 		vars["cursor"] = cursor
+	}
+	if len(states) > 0 {
+		vars["states"] = states
 	}
 
 	var resp struct {

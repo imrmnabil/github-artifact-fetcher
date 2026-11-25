@@ -83,7 +83,7 @@ func ExtractRepository(ctx context.Context, st *store.Store, opts ExtractOptions
 		opts.OnStage("Git Bare Clone")
 	}
 
-	if err := cloneOrFetchBare(ctx, cloneURL, repoDir, opts.Token, opts.KeepGit, opts.SinceCommitTime); err != nil {
+	if err := cloneOrFetchBare(ctx, cloneURL, repoDir, opts.Token, opts.KeepGit, opts.SinceCommitTime, opts.OnStage); err != nil {
 		return nil, err
 	}
 
@@ -105,7 +105,8 @@ func ExtractRepository(ctx context.Context, st *store.Store, opts ExtractOptions
 	totalCommits := 0
 	totalFiles := 0
 
-	err = streamCommitsAndChurn(ctx, repoDir, opts, func(batch []store.Commit) error {
+	// 1. Stream full line-level churn for all branches and tags (100% offline, all blobs local)
+	err = streamCommitsAndChurn(ctx, repoDir, opts, true, func(batch []store.Commit) error {
 		for _, c := range batch {
 			parentGraph[c.SHA] = c.ParentSHAs
 			if c.CommittedAt.After(latestCommit) {
@@ -124,6 +125,29 @@ func ExtractRepository(ctx context.Context, st *store.Store, opts ExtractOptions
 	})
 	if err != nil {
 		return nil, err
+	}
+
+	// 2. Stream metadata-only commits unique to blobless refs/pull/*/head (0 promisor blob fetches!)
+	if len(prHeadSHAs) > 0 {
+		if opts.OnStage != nil {
+			opts.OnStage("Git PR Commit Graph")
+		}
+		err = streamCommitsAndChurn(ctx, repoDir, opts, false, func(batch []store.Commit) error {
+			for _, c := range batch {
+				parentGraph[c.SHA] = c.ParentSHAs
+				totalCommits++
+			}
+			if err := st.UpsertCommitBatch(ctx, batch); err != nil {
+				return err
+			}
+			if opts.OnProgress != nil {
+				opts.OnProgress(totalCommits, totalFiles)
+			}
+			return nil
+		})
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	// Build zero-API PR -> Commit SHA links in Go memory using the parent DAG!
@@ -163,7 +187,7 @@ func gitEnvWithToken(token string) []string {
 	return env
 }
 
-func cloneOrFetchBare(ctx context.Context, cloneURL, repoDir, token string, keepGit bool, since time.Time) error {
+func cloneOrFetchBare(ctx context.Context, cloneURL, repoDir, token string, keepGit bool, since time.Time, onStage func(string)) error {
 	headFile := filepath.Join(repoDir, "HEAD")
 	_, statErr := os.Stat(headFile)
 	exists := statErr == nil
@@ -177,36 +201,120 @@ func cloneOrFetchBare(ctx context.Context, cloneURL, repoDir, token string, keep
 		}
 	}
 
-	fetchArgs := []string{
+	// Pass 1: Fetch branches & tags FULL (for offline line-level churn --numstat) with live progress
+	fetchMainArgs := []string{
 		"-C", repoDir,
 		"-c", "fetch.parallel=4",
-		"fetch", "--prune", "--no-write-fetch-head",
+		"fetch", "--prune", "--no-write-fetch-head", "--progress",
 	}
 	if !keepGit && !since.IsZero() {
-		// Buffer 24 hours earlier to account for clock skew / author vs committer time
 		cutoff := since.Add(-24 * time.Hour).UTC().Format(time.RFC3339)
-		fetchArgs = append(fetchArgs, "--shallow-since="+cutoff)
+		fetchMainArgs = append(fetchMainArgs, "--shallow-since="+cutoff)
 	}
-	fetchArgs = append(fetchArgs,
+	fetchMainArgs = append(fetchMainArgs,
 		cloneURL,
 		"+refs/heads/*:refs/heads/*",
 		"+refs/tags/*:refs/tags/*",
+	)
+	if err := runGitFetchWithProgress(ctx, fetchMainArgs, token, since, "Git Clone", onStage); err != nil {
+		return fmt.Errorf("git bare fetch %s: %w", cloneURL, err)
+	}
+
+	// Pass 2: Fetch +refs/pull/*/head BLOBLESS (--filter=blob:none) so 30k+ PR refs download in seconds
+	// without pulling gigabytes of abandoned PR file blobs!
+	fetchPRArgs := []string{
+		"-C", repoDir,
+		"-c", "fetch.parallel=4",
+		"fetch", "--prune", "--no-write-fetch-head", "--progress",
+	}
+	if strings.HasPrefix(cloneURL, "http://") || strings.HasPrefix(cloneURL, "https://") {
+		fetchPRArgs = append(fetchPRArgs, "--filter=blob:none")
+	}
+	fetchPRArgs = append(fetchPRArgs,
+		cloneURL,
 		"+refs/pull/*/head:refs/pull/*/head",
 	)
+	// Non-fatal if remote has no PR refs or doesn't support partial clone filter
+	if err := runGitFetchWithProgress(ctx, fetchPRArgs, token, since, "Git PR Refs", onStage); err != nil {
+		// Retry without --filter=blob:none only if local test repo or non-partial server
+		if !strings.HasPrefix(cloneURL, "http://") && !strings.HasPrefix(cloneURL, "https://") {
+			return fmt.Errorf("git pr refs fetch %s: %w", cloneURL, err)
+		}
+	}
+	return nil
+}
 
-	cmd := exec.CommandContext(ctx, "git", fetchArgs...)
+func runGitFetchWithProgress(ctx context.Context, args []string, token string, since time.Time, label string, onStage func(string)) error {
+	cmd := exec.CommandContext(ctx, "git", args...)
 	cmd.Env = gitEnvWithToken(token)
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
-		// If --shallow-since fails on a repo with zero commits since cutoff, treat gracefully
-		msg := stderr.String()
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		return err
+	}
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+
+	var errBuf bytes.Buffer
+	reader := bufio.NewReader(stderr)
+	for {
+		line, rerr := readCRorLF(reader)
+		if line != "" {
+			errBuf.WriteString(line)
+			errBuf.WriteByte('\n')
+			if onStage != nil {
+				if compact := compactGitProgress(label, line); compact != "" {
+					onStage(compact)
+				}
+			}
+		}
+		if rerr != nil {
+			break
+		}
+	}
+
+	if err := cmd.Wait(); err != nil {
+		msg := errBuf.String()
 		if !since.IsZero() && (strings.Contains(msg, "no commits selected") || strings.Contains(msg, "shallow file has changed")) {
 			return nil
 		}
-		return fmt.Errorf("git bare fetch %s: %w (%s)", cloneURL, err, strings.TrimSpace(msg))
+		return fmt.Errorf("%w (%s)", err, strings.TrimSpace(msg))
 	}
 	return nil
+}
+
+func readCRorLF(r *bufio.Reader) (string, error) {
+	var buf []byte
+	for {
+		b, err := r.ReadByte()
+		if err != nil {
+			return strings.TrimSpace(string(buf)), err
+		}
+		if b == '\r' || b == '\n' {
+			if len(buf) > 0 {
+				return strings.TrimSpace(string(buf)), nil
+			}
+			continue
+		}
+		buf = append(buf, b)
+	}
+}
+
+func compactGitProgress(label, line string) string {
+	l := strings.TrimPrefix(line, "remote: ")
+	switch {
+	case strings.Contains(l, "Receiving objects:"):
+		if idx := strings.Index(l, "Receiving objects:"); idx >= 0 {
+			return label + " " + strings.TrimSpace(l[idx+len("Receiving objects:"):])
+		}
+	case strings.Contains(l, "Resolving deltas:"):
+		if idx := strings.Index(l, "Resolving deltas:"); idx >= 0 {
+			return label + " deltas " + strings.TrimSpace(l[idx+len("Resolving deltas:"):])
+		}
+	case strings.Contains(l, "Counting objects:"):
+		return label + " counting..."
+	}
+	return ""
 }
 
 func readAllRefs(ctx context.Context, repoDir string, repoID int64, defaultBranch string) ([]store.GitRef, map[int]string, string, error) {
@@ -270,21 +378,30 @@ func readAllRefs(ctx context.Context, repoDir string, repoID int64, defaultBranc
 	return refs, prHeads, defaultHeadSHA, nil
 }
 
-// streamCommitsAndChurn streams `git log --all --numstat -z` in constant O(1) memory,
-// invoking flushBatch every 400 commits.
-func streamCommitsAndChurn(ctx context.Context, repoDir string, opts ExtractOptions, flushBatch func([]store.Commit) error) error {
-	// Check if repository is empty (zero refs)
-	checkCmd := exec.CommandContext(ctx, "git", "-C", repoDir, "rev-parse", "--all")
+// streamCommitsAndChurn streams git log in constant O(1) memory, invoking flushBatch every 400 commits.
+// When branchesAndTagsOnly is true, it walks --branches --tags WITH --numstat (100% local blobs).
+// When false, it walks blobless --glob=refs/pull/*/head --not --branches --tags WITHOUT --numstat (0 promisor fetches).
+func streamCommitsAndChurn(ctx context.Context, repoDir string, opts ExtractOptions, branchesAndTagsOnly bool, flushBatch func([]store.Commit) error) error {
+	// Check if repository has any refs for this pass
+	var checkArgs []string
+	if branchesAndTagsOnly {
+		checkArgs = []string{"-C", repoDir, "rev-parse", "--branches", "--tags"}
+	} else {
+		checkArgs = []string{"-C", repoDir, "rev-parse", "--glob=refs/pull/*/head"}
+	}
+	checkCmd := exec.CommandContext(ctx, "git", checkArgs...)
 	checkOut, _ := checkCmd.Output()
 	if len(bytes.TrimSpace(checkOut)) == 0 {
 		return nil
 	}
 
-	args := []string{
-		"-C", repoDir,
-		"log", "--all", "--date-order", "--numstat", "-z",
-		"--format=%x1e%H%x00%P%x00%an%x00%ae%x00%aI%x00%cn%x00%ce%x00%cI%x00%B%x00",
+	args := []string{"-C", repoDir, "log", "--date-order"}
+	if branchesAndTagsOnly {
+		args = append(args, "--branches", "--tags", "--numstat", "-z")
+	} else {
+		args = append(args, "--glob=refs/pull/*/head", "--not", "--branches", "--tags")
 	}
+	args = append(args, "--format=%x1e%H%x00%P%x00%an%x00%ae%x00%aI%x00%cn%x00%ce%x00%cI%x00%B%x00")
 	cmd := exec.CommandContext(ctx, "git", args...)
 	cmd.Env = gitEnvWithToken("")
 
@@ -318,7 +435,7 @@ func streamCommitsAndChurn(ctx context.Context, repoDir string, opts ExtractOpti
 			}
 			commit, perr := parseLogRecord(opts.RepoID, rawRecord)
 			if perr == nil && commit.SHA != "" {
-				if opts.IncludePatches && len(commit.Files) > 0 {
+				if branchesAndTagsOnly && opts.IncludePatches && len(commit.Files) > 0 {
 					populateCommitPatches(ctx, repoDir, &commit)
 				}
 				batch = append(batch, commit)
