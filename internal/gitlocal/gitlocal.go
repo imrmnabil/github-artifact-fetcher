@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"ghfetcher/internal/store"
@@ -244,9 +245,24 @@ func cloneOrFetchBare(ctx context.Context, cloneURL, repoDir, token string, keep
 	return nil
 }
 
-func runGitFetchWithProgress(ctx context.Context, args []string, token string, since time.Time, label string, onStage func(string)) error {
+func gitCommandContext(ctx context.Context, token string, args ...string) *exec.Cmd {
 	cmd := exec.CommandContext(ctx, "git", args...)
 	cmd.Env = gitEnvWithToken(token)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.WaitDelay = time.Second
+	cmd.Cancel = func() error {
+		if cmd.Process != nil {
+			// Kill the entire process group (git + git-remote-https + git-index-pack)
+			_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+			return cmd.Process.Kill()
+		}
+		return nil
+	}
+	return cmd
+}
+
+func runGitFetchWithProgress(ctx context.Context, args []string, token string, since time.Time, label string, onStage func(string)) error {
+	cmd := gitCommandContext(ctx, token, args...)
 	stderr, err := cmd.StderrPipe()
 	if err != nil {
 		return err
@@ -258,6 +274,9 @@ func runGitFetchWithProgress(ctx context.Context, args []string, token string, s
 	var errBuf bytes.Buffer
 	reader := bufio.NewReader(stderr)
 	for {
+		if ctx.Err() != nil {
+			break
+		}
 		line, rerr := readCRorLF(reader)
 		if line != "" {
 			errBuf.WriteString(line)
@@ -274,6 +293,9 @@ func runGitFetchWithProgress(ctx context.Context, args []string, token string, s
 	}
 
 	if err := cmd.Wait(); err != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
 		msg := errBuf.String()
 		if !since.IsZero() && (strings.Contains(msg, "no commits selected") || strings.Contains(msg, "shallow file has changed")) {
 			return nil
@@ -402,8 +424,7 @@ func streamCommitsAndChurn(ctx context.Context, repoDir string, opts ExtractOpti
 		args = append(args, "--glob=refs/pull/*/head", "--not", "--branches", "--tags")
 	}
 	args = append(args, "--format=%x1e%H%x00%P%x00%an%x00%ae%x00%aI%x00%cn%x00%ce%x00%cI%x00%B%x00")
-	cmd := exec.CommandContext(ctx, "git", args...)
-	cmd.Env = gitEnvWithToken("")
+	cmd := gitCommandContext(ctx, "", args...)
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {

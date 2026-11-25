@@ -228,11 +228,17 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.KeyMsg:
 		switch msg.String() {
 		case "ctrl+c", "q":
+			if m.quitting {
+				// Second press exits immediately without waiting
+				return m, tea.Quit
+			}
 			m.quitting = true
 			if !m.ctrl.IsRemote() {
 				m.ctrl.Stop()
 				if m.doneCh != nil {
-					return m, nil // Wait cleanly for doneMsg after checkpoint flush
+					return m, tea.Tick(4*time.Second, func(time.Time) tea.Msg {
+						return doneMsg{err: nil}
+					})
 				}
 			}
 			return m, tea.Quit
