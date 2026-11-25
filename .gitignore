@@ -1,0 +1,9 @@
+/ghfetcher
+*.db
+*.db-wal
+*.db-shm
+.ghfetcher/
+ghfetcher_data/
+ghfetcher_export_*/
+.agents/
+skills-lock.json
