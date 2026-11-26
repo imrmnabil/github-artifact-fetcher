@@ -15,7 +15,18 @@
 
 ## Quick Start
 
-### Build
+### Install (Pre-Built Binary)
+
+**Linux & macOS (one-liner with SHA256 verification):**
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/imrmnabil/github-artifact-fetcher/main/install.sh | sh
+```
+
+**Windows / Manual Download:**
+Download the pre-built archive for Linux (`amd64`/`arm64`), macOS (`amd64`/`arm64`), or Windows (`amd64`) from the [GitHub Releases](https://github.com/imrmnabil/github-artifact-fetcher/releases) page.
+
+**Build from Source (Go 1.24+):**
 
 ```bash
 CGO_ENABLED=0 go build -o ghfetcher ./cmd/ghfetcher
@@ -25,37 +36,29 @@ CGO_ENABLED=0 go build -o ghfetcher ./cmd/ghfetcher
 
 ```bash
 # Interactive TUI setup wizard (saves chmod 0600 ~/.config/ghfetcher/config.toml)
-./ghfetcher config
+ghfetcher config
 
 # Or scriptable CLI commands (SSH-friendly)
-./ghfetcher config import-gh
-./ghfetcher config add-token --label lab-pat-2
-./ghfetcher config list --check
+ghfetcher config import-gh
+ghfetcher config add-token --label lab-pat-2
+ghfetcher config list --check
 ```
 
 *(You can also pass comma-separated tokens via `GHFETCHER_TOKENS=ghp_1...,ghp_2...` or `GITHUB_TOKEN`.)*
 
-### 2. Pre-Flight Cost & ETA Dry Run (`ghfetcher estimate`)
-
-Spends **1 GraphQL point** (up to 35 repos per query) to inspect exact commit/issue/PR counts, disk usage, API quota needed, and projected wall-clock ETA:
-
-```bash
-./ghfetcher estimate facebook/react vercel/next.js
-```
-
-### 3. Fetch All Research Artifacts (`ghfetcher fetch -all`)
+### 2. Fetch All Research Artifacts (`ghfetcher fetch -all`)
 
 ```bash
 # Launches the interactive htop-style TUI
-./ghfetcher fetch -all facebook/react vercel/next.js --out react_study.db
+ghfetcher fetch -all facebook/react vercel/next.js --out react_study.db
 
 # Fetch from a corpus file with full unified commit patches
-./ghfetcher fetch -all --patches --from repos.txt --out corpus.db
+ghfetcher fetch -all --patches --from repos.txt --out corpus.db
 
 # Run headless on an SSH research server, then attach the live htop TUI anytime!
-nohup ./ghfetcher fetch -all kubernetes/kubernetes --out k8s.db --no-tui > fetch.log 2>&1 &
-./ghfetcher attach --db k8s.db
-./ghfetcher status --db k8s.db
+nohup ghfetcher fetch -all kubernetes/kubernetes --out k8s.db --no-tui > fetch.log 2>&1 &
+ghfetcher attach --db k8s.db
+ghfetcher status --db k8s.db
 ```
 
 ### Interactive `htop` TUI Hotkeys
@@ -66,11 +69,11 @@ nohup ./ghfetcher fetch -all kubernetes/kubernetes --out k8s.db --no-tui > fetch
 - `t` — Hot-reload tokens from `config.toml` / env without restarting
 - `q` / `Ctrl+C` — Flush SQLite WAL checkpoints and exit cleanly (`ghfetcher fetch` resumes right where it left off!)
 
-### 4. Export to Parquet or JSONL (`ghfetcher export`)
+### 3. Export to Parquet or JSONL (`ghfetcher export`)
 
 ```bash
-./ghfetcher export --db react_study.db --format parquet --out ./parquet_data
-./ghfetcher export --db react_study.db --format jsonl   --out ./jsonl_data
+ghfetcher export --db react_study.db --format parquet --out ./parquet_data
+ghfetcher export --db react_study.db --format jsonl   --out ./jsonl_data
 ```
 
 Query directly in **DuckDB** or **Python / Polars**:

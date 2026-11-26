@@ -18,8 +18,9 @@ func newEstimateCmd(gf *globalFlags) *cobra.Command {
 	var fromFile string
 
 	cmd := &cobra.Command{
-		Use:   "estimate [<owner/repo>...]",
-		Short: "1-point GraphQL dry-run showing exact repo artifact counts, disk size, API cost & ETA",
+		Use:    "estimate [<owner/repo>...]",
+		Short:  "[experimental] 1-point GraphQL dry-run showing exact repo artifact counts and disk size",
+		Hidden: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cfg, _, err := config.Load(gf.configPath)
 			if err != nil {

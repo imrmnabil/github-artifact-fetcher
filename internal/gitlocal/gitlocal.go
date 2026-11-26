@@ -12,7 +12,6 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"syscall"
 	"time"
 
 	"ghfetcher/internal/store"
@@ -248,16 +247,8 @@ func cloneOrFetchBare(ctx context.Context, cloneURL, repoDir, token string, keep
 func gitCommandContext(ctx context.Context, token string, args ...string) *exec.Cmd {
 	cmd := exec.CommandContext(ctx, "git", args...)
 	cmd.Env = gitEnvWithToken(token)
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.WaitDelay = time.Second
-	cmd.Cancel = func() error {
-		if cmd.Process != nil {
-			// Kill the entire process group (git + git-remote-https + git-index-pack)
-			_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
-			return cmd.Process.Kill()
-		}
-		return nil
-	}
+	configureProcessGroup(cmd)
 	return cmd
 }
 

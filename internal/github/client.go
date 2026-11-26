@@ -15,6 +15,7 @@ import (
 
 	"ghfetcher/internal/store"
 	"ghfetcher/internal/tokenpool"
+	"ghfetcher/internal/version"
 )
 
 const (
@@ -138,7 +139,7 @@ func (c *Client) DoGraphQL(ctx context.Context, query string, vars map[string]an
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("Accept", "application/vnd.github+json")
 		req.Header.Set("Accept-Encoding", "gzip")
-		req.Header.Set("User-Agent", "ghfetcher/0.1.0 (MSR-Research)")
+		req.Header.Set("User-Agent", "ghfetcher/"+version.Version+" (MSR-Research)")
 
 		resp, doErr := c.httpClient.Do(req)
 		if doErr != nil {
@@ -276,7 +277,7 @@ func (c *Client) DoRESTGet(ctx context.Context, pathOrURL string, useETag bool, 
 		req.Header.Set("Accept", "application/vnd.github+json")
 		req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
 		req.Header.Set("Accept-Encoding", "gzip")
-		req.Header.Set("User-Agent", "ghfetcher/0.1.0 (MSR-Research)")
+		req.Header.Set("User-Agent", "ghfetcher/"+version.Version+" (MSR-Research)")
 
 		if useETag && c.store != nil {
 			if etag := c.store.GetETag(ctx, fullURL); etag != "" {
