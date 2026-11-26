@@ -1,94 +1,124 @@
-# `ghfetcher` — High-Efficiency GitHub Artifact Fetcher for Research
+<div align="center">
 
-`ghfetcher` is a single-binary Go CLI and `htop`-style terminal dashboard built for **Mining Software Repositories (MSR)** and empirical software engineering research. It extracts commits, line-level churn, pull requests, issues, code reviews, inline diff comments, reactions, and lifecycle timeline events while slashing GitHub API quota consumption by **90–99%**.
+# `ghfetcher`
 
-## How It Saves API Quota
+**Ultra-efficient GitHub artifact miner for MSR & empirical software engineering research.**
 
-1. **Zero-API Ephemeral Bare Git Extraction (`+refs/pull/*`)**: Clones bare Git repositories locally (with `+refs/pull/*/head`), streaming 100% of commits, commit messages, parent DAGs, file-level `+additions/-deletions` churn (`--numstat`), optional unified patches, and **PR-to-commit SHA mappings** (even for closed/unmerged PRs) for **0 REST/GraphQL calls**, then cleans up `.git` automatically.
-2. **Dual-Pool Per-Token Parallelism**: Every GitHub PAT has **5,000 GraphQL points/hr** *and* **5,000 REST requests/hr** in separate buckets. `ghfetcher` schedules both concurrently across multiple tokens while keeping a configurable **100-quota safety reserve** per token.
-3. **1-Point Bundled GraphQL + Repo-Wide Bulk REST**:
-   - **GraphQL** fetches Issues & PRs ordered by `UPDATED_AT` with labels, assignees, reactions, reviews, comments, and timeline events bundled inline (~95% of items need zero follow-up calls).
-   - **REST** sweeps `/repos/{owner}/{repo}/pulls/comments?per_page=100` repo-wide (100 inline diff comments per request instead of per-PR requests) with `ETag` (`If-None-Match`) caching (`304 Not Modified` costs **0** quota).
-4. **Offline Continuation During API Cooldowns**: If all tokens reach their safety reserve on huge studies, API workers sleep until the earliest hourly reset and auto-resume—while local Git clone/churn workers keep indexing queued repos uninterrupted.
+[![Release](https://img.shields.io/github/v/release/imrmnabil/github-artifact-fetcher?include_prereleases&style=flat-square&color=00E676)](https://github.com/imrmnabil/github-artifact-fetcher/releases)
+[![CI](https://img.shields.io/github/actions/workflow/status/imrmnabil/github-artifact-fetcher/ci.yml?branch=main&style=flat-square)](https://github.com/imrmnabil/github-artifact-fetcher/actions)
+[![Go 1.24+](https://img.shields.io/badge/Go-1.24+-00ADD8?style=flat-square&logo=go&logoColor=white)](https://go.dev/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue?style=flat-square)](LICENSE)
+
+*Zero-API bare Git extraction · Dual-pool GraphQL + REST scheduling · Multi-token load balancing · `htop`-style TUI · SQLite WAL & Apache Parquet*
+
+</div>
 
 ---
 
-## Quick Start
+<p align="center">
+  <img src="docs/assets/tui-dashboard.png" alt="ghfetcher htop-style interactive TUI dashboard" width="95%" />
+</p>
 
-### Install (Pre-Built Binary)
+## Why `ghfetcher`?
 
-**Linux & macOS (one-liner with SHA256 verification):**
+Mining GitHub repositories for research (commits, line churn, pull requests, issues, code reviews, inline diff comments, reactions, and timeline events) normally burns through hourly API limits in minutes. **`ghfetcher` cuts API calls by 90–99%** without sacrificing data completeness:
+
+| Artifact *(example: 25k commits, 4k PRs, 3k issues, 24k comments)* | Naive REST Crawler | Pure GraphQL Crawler | `ghfetcher` Hybrid + Bare Git |
+| :--- | ---: | ---: | ---: |
+| Commits, messages & per-file `+add/-del` churn | ~25,250 calls | ~500+ pts *(no churn)* | **0 API calls** *(ephemeral bare Git)* |
+| PR → Commit SHA mappings *(incl. closed/unmerged PRs)* | 4,000 calls | ~80 pts | **0 API calls** *(`+refs/pull/*/head`)* |
+| Issues, PRs, labels, reviews, reactions & timeline | ~19,000 calls | ~160 pts | **~110 GQL pts** *(4-stream parallel)* |
+| Inline PR diff comments + discussion comments | ~7,000 calls | ~200 pts | **~240 REST calls** *(repo-wide 100/call + 304 ETag)* |
+| **Total Quota Consumed** | **~55,250 calls** | **~940 pts** | **~110 GQL pts + ~240 REST calls** |
+
+### Key Highlights
+- **Zero-API 2-Step Bare Git Pipeline**: Fetches branches/tags full for offline `--numstat` line churn (and optional `--patches`), fetches `+refs/pull/*/head` **blobless** (`--filter=blob:none`) so 30k+ PR refs download in seconds, links PRs to commits in Go memory, then auto-deletes temp `.git` dirs.
+- **Dual-Pool Multi-Token Scheduler**: Uses every token's **5,000 GraphQL pts/hr** AND **5,000 REST req/hr** simultaneously with a configurable **100-quota safety reserve**, automatic secondary rate-limit rotation, and non-blocking offline Git extraction during API cooldowns.
+- **Crash-Resumable SQLite WAL + Columnar Parquet**: Every page commits atomically alongside `_sync_checkpoints`—stop anytime with `q` / `Ctrl+C` and resume cleanly later. Export all 12 normalized tables to Snappy **Apache Parquet** or **JSONL** in seconds.
+- **Remote Server Friendly (`--no-tui` + `attach`)**: Run headless under `nohup` / `tmux` over SSH and attach the live `htop` dashboard anytime via `ghfetcher attach --db study.db`.
+
+---
+
+## Installation
+
+### Linux & macOS (Recommended One-Liner)
+Downloads the latest release binary and verifies its SHA256 checksum automatically:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/imrmnabil/github-artifact-fetcher/main/install.sh | sh
 ```
 
-**Windows / Manual Download:**
-Download the pre-built archive for Linux (`amd64`/`arm64`), macOS (`amd64`/`arm64`), or Windows (`amd64`) from the [GitHub Releases](https://github.com/imrmnabil/github-artifact-fetcher/releases) page.
+### Windows & Manual Downloads
+Grab pre-built archives for Linux (`amd64`, `arm64`), macOS (`amd64`, `arm64`), and Windows (`amd64`) from [GitHub Releases](https://github.com/imrmnabil/github-artifact-fetcher/releases).
 
-**Build from Source (Go 1.24+):**
+### Build from Source (Go 1.24+)
 
 ```bash
+git clone https://github.com/imrmnabil/github-artifact-fetcher.git
+cd github-artifact-fetcher
 CGO_ENABLED=0 go build -o ghfetcher ./cmd/ghfetcher
 ```
 
-### 1. Configure Tokens (`ghfetcher config`)
+---
+
+## Quick Start
+
+### 1. Configure Your Token Pool (`ghfetcher config`)
 
 ```bash
-# Interactive TUI setup wizard (saves chmod 0600 ~/.config/ghfetcher/config.toml)
+# Interactive TUI wizard (writes chmod 0600 ~/.config/ghfetcher/config.toml)
 ghfetcher config
 
-# Or scriptable CLI commands (SSH-friendly)
-ghfetcher config import-gh
-ghfetcher config add-token --label lab-pat-2
-ghfetcher config list --check
+# Or scriptable CLI commands (ideal for headless SSH servers)
+ghfetcher config import-gh                  # Import from `gh auth token`
+ghfetcher config add-token --label lab-pat  # Add additional PATs to multiply hourly throughput
+ghfetcher config list --check               # Verify live REST & GraphQL balances
 ```
 
-*(You can also pass comma-separated tokens via `GHFETCHER_TOKENS=ghp_1...,ghp_2...` or `GITHUB_TOKEN`.)*
+<p align="center">
+  <img src="docs/assets/cli-config-status.png" alt="ghfetcher config list and study status" width="84%" />
+</p>
 
 ### 2. Fetch All Research Artifacts (`ghfetcher fetch -all`)
 
 ```bash
-# Launches the interactive htop-style TUI
-ghfetcher fetch -all facebook/react vercel/next.js --out react_study.db
+# Interactive htop-style dashboard
+ghfetcher fetch -all facebook/react vercel/next.js --out msr_study.db
 
-# Fetch from a corpus file with full unified commit patches
+# Batch corpus from a file (with full unified commit diffs)
 ghfetcher fetch -all --patches --from repos.txt --out corpus.db
 
-# Run headless on an SSH research server, then attach the live htop TUI anytime!
-nohup ghfetcher fetch -all kubernetes/kubernetes --out k8s.db --no-tui > fetch.log 2>&1 &
-ghfetcher attach --db k8s.db
-ghfetcher status --db k8s.db
+# Headless SSH server execution + live remote TUI attach
+nohup ghfetcher fetch -all huggingface/transformers --out hf.db --no-tui > fetch.log 2>&1 &
+ghfetcher attach --db hf.db
 ```
 
-### Interactive `htop` TUI Hotkeys
-- `Space` / `p` — Pause / Resume pipeline cleanly
-- `↑` / `↓` (`j` / `k`) — Select repository in process table
-- `Enter` / `l` — Toggle detailed Repo Inspector vs. Live Event Log
-- `+` / `-` — Dynamically increase or decrease concurrent repository workers
-- `t` — Hot-reload tokens from `config.toml` / env without restarting
-- `q` / `Ctrl+C` — Flush SQLite WAL checkpoints and exit cleanly (`ghfetcher fetch` resumes right where it left off!)
-
-### 3. Export to Parquet or JSONL (`ghfetcher export`)
+### 3. Export to Apache Parquet or JSONL (`ghfetcher export`)
 
 ```bash
-ghfetcher export --db react_study.db --format parquet --out ./parquet_data
-ghfetcher export --db react_study.db --format jsonl   --out ./jsonl_data
+ghfetcher export --db msr_study.db --format parquet --out ./study_parquet
+ghfetcher export --db msr_study.db --format jsonl   --out ./study_jsonl
 ```
 
-Query directly in **DuckDB** or **Python / Polars**:
+<p align="center">
+  <img src="docs/assets/cli-export.png" alt="ghfetcher export to Apache Parquet" width="84%" />
+</p>
 
-```python
-import duckdb
+---
 
-con = duckdb.connect()
-df = con.execute("""
-    SELECT pr.number, pr.title, pr.merged, COUNT(pc.commit_sha) AS pr_commits, SUM(c.additions) AS lines_added
-    FROM 'parquet_data/pull_requests.parquet' pr
-    LEFT JOIN 'parquet_data/pr_commits.parquet' pc USING (repo_id, number)
-    LEFT JOIN 'parquet_data/commits.parquet' c ON c.repo_id = pc.repo_id AND c.sha = pc.commit_sha
-    GROUP BY ALL
-    ORDER BY lines_added DESC
-    LIMIT 10
-""").df()
-```
+## Documentation
+
+Detailed guides live in the [`docs/`](docs/) directory:
+
+| Guide | What's Inside |
+| :--- | :--- |
+| **[Architecture & Efficiency](docs/architecture.md)** | 2-step bare Git pipeline, in-memory PR→SHA DAG linker, dual-pool token scheduler, 4-stream parallel GraphQL, and cooldown continuation |
+| **[CLI & TUI Reference](docs/cli-reference.md)** | Complete command/flag reference, environment variables, `config.toml` defaults, and `htop` TUI keybindings |
+| **[Database & Parquet Schema](docs/schema.md)** | ER diagram and full column reference for all 12 normalized research tables + internal checkpoint/cache tables |
+| **[Research Query Recipes](docs/research-queries.md)** | Ready-to-run SQL, DuckDB, and Python queries for review latency, commit churn, hotspot files, and force-push studies |
+
+---
+
+## License
+
+Released under the [MIT License](LICENSE).
